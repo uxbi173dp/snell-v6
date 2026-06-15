@@ -16,12 +16,14 @@
 #include <strings.h>
 #include <getopt.h>
 #include <arpa/inet.h>
+#include <signal.h>
 
 typedef struct {
     uv_tcp_t   listener;
     uv_loop_t *loop;
     int        is_socks;          /* 1=SOCKS5, 0=HTTP CONNECT */
-    char       server[256]; int server_port; char psk[256];
+    char       server[256]; int server_port;
+    const sn_profile_t *profile;  /* PSK-derived; built once in main(), shared by all conns */
     char       bind_addr[64];     /* local listen addr (also the UDP relay BND.ADDR) */
 } listener_t;
 
@@ -51,6 +53,7 @@ typedef struct {
     int         have_client_uaddr;
     struct sockaddr_storage ctrl_peer;     /* TCP control-conn peer; only accept datagrams from this IP (RFC 1928) */
     int         have_ctrl_peer;
+    uint8_t    *relay_rdbuf;      /* pooled client->server read buffer (relay phase), freed at teardown */
 } conn_t;
 
 #define WQ_HIGH (512*1024)   /* pause server reads when client write queue exceeds this */
@@ -60,13 +63,23 @@ typedef struct {
 #endif
 
 static int g_shape_out = 1;  /* outbound traffic shaping (--no-shape disables) */
-static uint8_t g_connect_cmd = 0x01;  /* TCP CONNECT cmd: 0x01, or 0x05 (= CONNECT + target half-close tolerance) */
+static uint8_t g_connect_cmd = SN_CMD_CONNECT;  /* TCP CONNECT; --connect-cmd 5 selects SN_CMD_CONNECT_HC (half-close tolerant) */
 static char g_client_id[256] = ""; static uint8_t g_client_id_len = 0;  /* --client-id */
 static int g_tcp_fastopen = 0;  /* --tcp-fastopen: TFO for the client->server connection */
 int sn_log_verbose = 0;  /* -v: chatty per-connection diagnostics (default quiet) */
 #define PLOG(...) do { if (sn_log_verbose) fprintf(stderr, __VA_ARGS__); } while (0)
 
-static void alloc_cb(uv_handle_t *h, size_t sz, uv_buf_t *b){ (void)h; size_t n=sz<65536?65536:sz; b->base=malloc(n); b->len=b->base?n:0; }
+#define CLIENT_RDBUF_SZ 65536   /* per-read window for client (c->s) reads */
+static void alloc_cb(uv_handle_t *h, size_t sz, uv_buf_t *b){ (void)h; size_t n=sz<CLIENT_RDBUF_SZ?CLIENT_RDBUF_SZ:sz; b->base=malloc(n); b->len=b->base?n:0; }
+/* Pooled allocator for the client->server RELAY read: hands libuv a persistent
+ * per-conn buffer that on_client_relay consumes synchronously (encrypts into the
+ * wire record) — so the hot c->s path has no per-read malloc, mirroring the s->c
+ * rx_alloc design. Freed once at conn teardown. */
+static void relay_alloc(uv_handle_t *h, size_t sz, uv_buf_t *b){
+    (void)sz; conn_t *c=(conn_t*)h->data;
+    if (!c->relay_rdbuf) c->relay_rdbuf = malloc(CLIENT_RDBUF_SZ);
+    b->base=(char*)c->relay_rdbuf; b->len=c->relay_rdbuf?CLIENT_RDBUF_SZ:0;
+}
 static void after_write(uv_write_t *w, int st){ (void)st; free(w->data); free(w); }
 
 /* write bytes to a uv_stream (copies) */
@@ -77,12 +90,13 @@ static void stream_write(uv_stream_t *s, const void *p, size_t n){
     uv_write(w,s,&b,1,after_write);
 }
 
-static void conn_free(uv_handle_t *h){ free(h->data); }   /* accept-fail path only (no tunnel) */
+static void conn_destroy(conn_t *c){ free(c->relay_rdbuf); free(c); }   /* the one place a conn_t is freed */
+static void conn_free(uv_handle_t *h){ conn_destroy((conn_t*)h->data); }   /* accept-fail path only (no tunnel) */
 /* The conn embeds the client TCP, an optional UDP relay socket, AND the tunnel's
  * TCP handle. Each has an async uv_close callback; the conn must be freed only
  * after ALL of them fire, or a late tunnel-tcp close callback reads freed memory
  * (heap-use-after-free, snell_tunnel.c on_tcp_closed). `nclose` counts them. */
-static void dec_free(conn_t *c){ if (--c->nclose <= 0) free(c); }
+static void dec_free(conn_t *c){ if (--c->nclose <= 0) conn_destroy(c); }
 static void on_handle_closed(uv_handle_t *h){ dec_free((conn_t*)h->data); }     /* client / udp */
 static void on_tun_tcp_closed(void *user){ dec_free((conn_t*)user); }           /* tunnel tcp   */
 /* Begin closing every handle the conn owns; free happens in the last callback. */
@@ -95,7 +109,7 @@ static void conn_close(conn_t *c){
     if (c->ctimer_inited && !uv_is_closing((uv_handle_t*)&c->ctimer)) { c->nclose++; uv_close((uv_handle_t*)&c->ctimer, on_handle_closed); }
     if (!uv_is_closing((uv_handle_t*)&c->client)) { c->nclose++; uv_close((uv_handle_t*)&c->client, on_handle_closed); }
     if (c->udp_inited && !uv_is_closing((uv_handle_t*)&c->udp)) { c->nclose++; uv_close((uv_handle_t*)&c->udp, on_handle_closed); }
-    if (c->nclose==0) free(c);
+    if (c->nclose==0) conn_destroy(c);
 }
 
 /* ---- tunnel callbacks ---- */
@@ -108,11 +122,26 @@ static void after_client_write(uv_write_t *w, int st){
     if (c->paused && c->client_wq <= WQ_LOW) { PLOG("[proxy] backpressure resume (wq=%zu)\n", c->client_wq); c->paused=0; sn_tunnel_resume(&c->tunnel); }
 }
 static void client_write(conn_t *c, const void *p, size_t n){
-    char *buf=malloc(n); if(!buf) return; memcpy(buf,p,n);
-    cwreq_t *wr=malloc(sizeof(*wr)); if(!wr){free(buf);return;}
-    wr->c=c; wr->n=n; wr->buf=buf;
-    uv_buf_t b=uv_buf_init(buf,n); c->client_wq += n;
-    uv_write((uv_write_t*)wr,(uv_stream_t*)&c->client,&b,1,after_client_write);
+    if (c->closing || n == 0) return;
+    size_t sent = 0;
+    /* When nothing is queued, write synchronously: uv_try_write copies straight
+     * into the socket buffer with no allocation. We must NOT do this while ANY
+     * write is pending in libuv's queue — a queued client_write remainder OR the
+     * SOCKS5/HTTP success reply sent via stream_write (which client_wq does not
+     * track) — or the sync bytes would overtake it and reorder the stream. Gate
+     * on the real libuv write-queue depth, which counts every pending uv_write. */
+    if (uv_stream_get_write_queue_size((uv_stream_t*)&c->client) == 0) {
+        uv_buf_t b = uv_buf_init((char*)p, n);
+        int w = uv_try_write((uv_stream_t*)&c->client, &b, 1);
+        if (w > 0) sent = (size_t)w;
+        if (sent >= n) return;   /* fully flushed; nothing to queue */
+    }
+    /* queue the remainder (partial sync write, EAGAIN, or queue not empty) */
+    size_t rn = n - sent; char *buf = malloc(rn); if (!buf) return; memcpy(buf, (const uint8_t*)p + sent, rn);
+    cwreq_t *wr = malloc(sizeof(*wr)); if (!wr) { free(buf); return; }
+    wr->c=c; wr->n=rn; wr->buf=buf;
+    uv_buf_t qb = uv_buf_init(buf, rn); c->client_wq += rn;
+    if (uv_write((uv_write_t*)wr,(uv_stream_t*)&c->client,&qb,1,after_client_write) != 0) { c->client_wq -= rn; free(buf); free(wr); }
 }
 /* ---- UDP ASSOCIATE relay (SOCKS5 CMD 0x03 <-> Snell cmd 0x06) ---- */
 typedef struct { uv_udp_send_t req; char *buf; } udp_send_req_t;
@@ -120,10 +149,14 @@ static void on_udp_send_done(uv_udp_send_t *req, int st){ (void)st; udp_send_req
 /* send one datagram to the local SOCKS5 client's UDP source address */
 static void udp_to_client(conn_t *c, const uint8_t *data, size_t n){
     if (!c->have_client_uaddr || c->closing) return;
+    uv_buf_t b = uv_buf_init((char*)data, n);
+    /* try a synchronous datagram send first (no allocation); UDP sends are atomic */
+    if (uv_udp_try_send(&c->udp, &b, 1, (const struct sockaddr*)&c->client_uaddr) >= 0) return;
+    /* would block / transient: fall back to a queued async send */
     char *buf=malloc(n); if(!buf) return; memcpy(buf,data,n);
     udp_send_req_t *r=malloc(sizeof(*r)); if(!r){ free(buf); return; }
-    r->buf=buf; uv_buf_t b=uv_buf_init(buf,n);
-    if (uv_udp_send((uv_udp_send_t*)r,&c->udp,&b,1,(const struct sockaddr*)&c->client_uaddr,on_udp_send_done)!=0){ free(buf); free(r); }
+    r->buf=buf; uv_buf_t qb=uv_buf_init(buf,n);
+    if (uv_udp_send((uv_udp_send_t*)r,&c->udp,&qb,1,(const struct sockaddr*)&c->client_uaddr,on_udp_send_done)!=0){ free(buf); free(r); }
 }
 /* server->client datagram from the tunnel: [atyp 0x04/0x06][addr][port BE][data]
  * -> wrap in a SOCKS5 UDP reply header and deliver to the client. */
@@ -254,7 +287,7 @@ static void on_tun_close(sn_tunnel_t *t, int err){
         uv_close((uv_handle_t*)&c->client, on_handle_closed);
     }
 done:
-    if (c->nclose==0) free(c);
+    if (c->nclose==0) conn_destroy(c);
 }
 
 /* half-close: shut our write side to the local client without closing the conn */
@@ -263,7 +296,7 @@ static void on_halfclose_shutdown_done(uv_shutdown_t *req, int st){ (void)st; fr
  * signal EOF to the local client's read side, keep relaying local->tunnel. */
 static void on_tun_peer_eof(sn_tunnel_t *t){
     conn_t *c=(conn_t*)t->user; if (c->closing || c->peer_weof) return;
-    if (c->tunnel.cmd != 0x05) return;   /* in-band half-close (zero-trunk) only applies to cmd 0x05 */
+    if (c->tunnel.cmd != SN_CMD_CONNECT_HC) return;   /* in-band half-close (zero-trunk) only applies to cmd 0x05 */
     c->peer_weof = 1;
     if (sn_log_verbose) PLOG("[proxy] peer half-close (s->c EOF)\n");
     if (c->client_weof) { conn_close(c); return; }          /* both sides done */
@@ -277,8 +310,7 @@ static void on_tun_peer_eof(sn_tunnel_t *t){
 static void on_client_relay(uv_stream_t *s, ssize_t n, const uv_buf_t *b){
     conn_t *c=(conn_t*)s->data;
     if (n == UV_EOF) {                       /* local client closed its write side */
-        free(b->base);
-        if (c->tunnel.cmd == 0x05 && !c->client_weof) {     /* half-close: signal c->s EOF in-band */
+        if (c->tunnel.cmd == SN_CMD_CONNECT_HC && !c->client_weof) {  /* half-close: signal c->s EOF in-band */
             c->client_weof = 1;
             if (sn_log_verbose) PLOG("[proxy] local half-close (c->s EOF)\n");
             sn_tunnel_send_eof(&c->tunnel);
@@ -289,11 +321,10 @@ static void on_client_relay(uv_stream_t *s, ssize_t n, const uv_buf_t *b){
         }
         return;
     }
-    if (n < 0) { free(b->base); conn_close(c); return; }     /* error/RST */
-    if (n == 0) { free(b->base); return; }                  /* EAGAIN, not EOF */
+    if (n < 0) { conn_close(c); return; }     /* error/RST */
+    if (n == 0) return;                       /* EAGAIN, not EOF */
     c->up_bytes += n;
-    int wr = sn_tunnel_write(&c->tunnel,(const uint8_t*)b->base,n);
-    free(b->base);
+    int wr = sn_tunnel_write(&c->tunnel,(const uint8_t*)b->base,n);   /* b->base is the pooled relay_rdbuf */
     if (wr != 0) { conn_close(c); return; }   /* don't silently drop c->s bytes on encode/write failure */
     /* c->s backpressure: stop reading the local client while the server-side TCP write
      * queue is large; on_tun_tx_drain resumes it once the queue drains. */
@@ -312,7 +343,7 @@ static void on_tun_tx_drain(sn_tunnel_t *t){
     if (uv_stream_get_write_queue_size((uv_stream_t*)&t->tcp) > WQ_LOW) return;
     if (uv_is_closing((uv_handle_t*)&c->client)) return;
     c->crd_paused = 0;
-    uv_read_start((uv_stream_t*)&c->client, alloc_cb, on_client_relay);
+    uv_read_start((uv_stream_t*)&c->client, relay_alloc, on_client_relay);
     PLOG("[proxy] c->s backpressure resume (txwq=%zu)\n", uv_stream_get_write_queue_size((uv_stream_t*)&t->tcp));
 }
 
@@ -353,7 +384,7 @@ static void on_tun_ready(sn_tunnel_t *t){
     }
     c->phase=1;
     PLOG("[proxy] tunnel ready -> client (success sent), relaying\n");
-    uv_read_start((uv_stream_t*)&c->client, alloc_cb, on_client_relay);
+    uv_read_start((uv_stream_t*)&c->client, relay_alloc, on_client_relay);
 }
 
 /* Pre-ready watchdog: the server is lazy-status (no connect-ack), so a black-holed
@@ -372,7 +403,7 @@ static void on_connect_timeout(uv_timer_t *h){
 static void start_tunnel(conn_t *c){
     uv_read_stop((uv_stream_t*)&c->client);
     PLOG("[proxy] %s %s:%d\n", c->L->is_socks?"SOCKS5":"CONNECT", c->target_host, c->target_port);
-    int rc = sn_tunnel_open(&c->tunnel, c->loop, c->L->server, c->L->server_port, c->L->psk,
+    int rc = sn_tunnel_open(&c->tunnel, c->loop, c->L->server, c->L->server_port, c->L->profile,
                        c->target_host, c->target_port, g_connect_cmd,
                        on_tun_data, on_tun_ready, on_tun_close, c);
     c->tunnel.shape_out = g_shape_out;
@@ -398,8 +429,8 @@ static void start_udp_associate(conn_t *c){
     struct sockaddr_in ba; uv_ip4_addr(c->L->bind_addr[0]?c->L->bind_addr:"127.0.0.1", 0, &ba);
     if (uv_udp_bind(&c->udp,(const struct sockaddr*)&ba,0)!=0){ PLOG("[proxy] udp bind failed\n"); conn_close(c); return; }
     PLOG("[proxy] SOCKS5 UDP ASSOCIATE -> snell udp (cmd 0x06)\n");
-    int rc=sn_tunnel_open(&c->tunnel,c->loop,c->L->server,c->L->server_port,c->L->psk,
-                          "",0,0x06, on_tun_data,on_tun_ready,on_tun_close,c);
+    int rc=sn_tunnel_open(&c->tunnel,c->loop,c->L->server,c->L->server_port,c->L->profile,
+                          "",0,SN_CMD_UDP, on_tun_data,on_tun_ready,on_tun_close,c);
     c->tunnel.shape_out = g_shape_out;
     c->tunnel.tcp_fastopen = g_tcp_fastopen;
     c->tunnel.on_tcp_closed_cb = on_tun_tcp_closed;
@@ -474,9 +505,9 @@ static void on_new_conn(uv_stream_t *sv, int st){
 }
 
 static int start_listener(listener_t *L, uv_loop_t *loop, int is_socks, const char *addr, int port,
-                          const char *server, int sport, const char *psk){
+                          const char *server, int sport, const sn_profile_t *profile){
     memset(L,0,sizeof(*L)); L->loop=loop; L->is_socks=is_socks; L->server_port=sport;
-    strncpy(L->server,server,sizeof L->server-1); strncpy(L->psk,psk,sizeof L->psk-1);
+    strncpy(L->server,server,sizeof L->server-1); L->profile=profile;
     strncpy(L->bind_addr,addr,sizeof L->bind_addr-1);
     uv_tcp_init(loop,&L->listener); L->listener.data=L;
     struct sockaddr_storage a; memset(&a,0,sizeof a);
@@ -488,6 +519,8 @@ static int start_listener(listener_t *L, uv_loop_t *loop, int is_socks, const ch
 
 int main(int argc,char**argv){
     if (sodium_init()<0){ fprintf(stderr,"sodium init failed\n"); return 1; }
+    signal(SIGPIPE, SIG_IGN);   /* a peer that vanishes mid-write must yield EPIPE, not kill us
+                                 * (uv_try_write writes synchronously, without MSG_NOSIGNAL) */
     char server[256]="", psk[256]="", listen_addr[64]="127.0.0.1";
     int sport=0, socks_port=1080, http_port=8080, en_socks=1, en_http=1;
     static struct option lo[]={{"server",1,0,'s'},{"server-port",1,0,'p'},{"psk",1,0,'k'},
@@ -498,16 +531,21 @@ int main(int argc,char**argv){
         case 's':strncpy(server,optarg,255);break; case 'p':sport=atoi(optarg);break; case 'k':strncpy(psk,optarg,255);break;
         case 'S':socks_port=atoi(optarg);break; case 'H':http_port=atoi(optarg);break; case 'l':strncpy(listen_addr,optarg,63);break;
         case 'A':en_socks=0;break; case 'B':en_http=0;break; case 'N':g_shape_out=0;break;
-        case 'C':g_connect_cmd=(atoi(optarg)==5)?0x05:0x01;break;
+        case 'C':g_connect_cmd=(atoi(optarg)==5)?SN_CMD_CONNECT_HC:SN_CMD_CONNECT;break;
         case 'I':{ strncpy(g_client_id,optarg,255); size_t n=strlen(g_client_id); g_client_id_len=(uint8_t)(n>255?255:n); break; }
         case 'v':sn_log_verbose=1;break; case 'F':g_tcp_fastopen=1;break; } }
     if(!server[0]||!psk[0]||!sport){ fprintf(stderr,"usage: %s --server H --server-port P --psk K [--socks5 1080] [--http 8080]\n",argv[0]); return 1; }
 
+    /* One PSK -> one profile: build the PSK-derived shaping profile once and share
+     * it (read-only) across every tunnel, instead of recomputing it per connection. */
+    static sn_profile_t profile;
+    if (sn_profile_init(&profile, psk) != 0){ fprintf(stderr,"profile init failed\n"); return 1; }
+
     uv_loop_t *loop=uv_default_loop();
     static listener_t s5,hp;
-    if(en_socks && start_listener(&s5,loop,1,listen_addr,socks_port,server,sport,psk)==0)
+    if(en_socks && start_listener(&s5,loop,1,listen_addr,socks_port,server,sport,&profile)==0)
         PLOG("[proxy] SOCKS5 on %s:%d\n",listen_addr,socks_port);
-    if(en_http && start_listener(&hp,loop,0,listen_addr,http_port,server,sport,psk)==0)
+    if(en_http && start_listener(&hp,loop,0,listen_addr,http_port,server,sport,&profile)==0)
         PLOG("[proxy] HTTP CONNECT on %s:%d\n",listen_addr,http_port);
     PLOG("[proxy] -> snell %s:%d\n",server,sport);
     uv_run(loop,UV_RUN_DEFAULT);

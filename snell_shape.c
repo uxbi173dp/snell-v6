@@ -1,136 +1,81 @@
 /*
- * snell_shape.c — Snell v6 (b2) profile & shaping (PRNG-driven).
+ * snell_shape.c — Snell v6 (b2) per-PSK profile & traffic shaping.
  *
- * The shaping PRNG (wyhash/splitmix seeded from BLAKE2b(PREFIX24||PSK)) is
- * fully reverse-engineered & verified — see snell_shape_prng.c for the
- * stand-alone reference + self-test. This file integrates it.
- *
- * Everything is derived from the PSK and is general (any PSK): salt
- * obfuscation S[]/PRF[] (via snell_salt_from_psk), prefix-pad lengths, and
- * de-interleave for all three modes (0 stride/const, 1 block-swap, 2 stride/PRNG).
+ * Builds the deployment profile from the PSK and implements the shaping the wire
+ * format needs: salt obfuscation, prefix-pad length, pad content (4 modes),
+ * chunk-size selection, and the inter_pad/payload de-interleave (3 modes).
+ * The underlying PRNG lives in snell_prng.c; the inter-pad length pipeline in
+ * snell_inter_pad.c. Stand-alone PRNG reference + self-test: snell_shape_prng.c.
  */
 #include "snell_shape.h"
-#include <sodium.h>
+#include "snell_prng.h"
+#include "snell_salt.h"
 #include <string.h>
-#include <stdio.h>
-
-static const uint8_t PREFIX24[24] = {
- 0x8d,0x41,0xa7,0x13,0x5c,0xe2,0x09,0xbb,0x70,0x2f,0xd6,0x94,
- 0x33,0x18,0xc0,0x6e,0x4a,0x91,0x25,0xfd,0xb8,0x03,0x77,0xac};
-
-/* general salt obfuscation derivation (snell_salt_prng.c), works for any PSK */
-extern void snell_salt_from_psk(const uint8_t *psk, size_t psklen,
-                                uint32_t *block_len, uint8_t S[16], uint8_t PRF[16]);
-
-/* ---- PRNG primitives (verified) ---- */
-static uint64_t rotr64(uint64_t x,int c){return (x>>c)|(x<<(64-c));}
-static uint64_t rotl64(uint64_t x,int c){return (x<<c)|(x>>(64-c));}
-static uint64_t rd_seedword(const uint8_t s[32],int i){uint64_t w=0;for(int j=0;j<8;j++)w|=(uint64_t)s[8*i+j]<<(8*j);return w;}
-static uint64_t splitmix64(uint64_t x){x^=x>>30;x*=0xbf58476d1ce4e5b9ULL;x^=x>>27;x*=0x94d049bb133111ebULL;x^=x>>31;return x;}
-static uint64_t subseed(const uint8_t seed[32],uint32_t idx,uint64_t K){
-    uint64_t S0=rd_seedword(seed,0),S1=rd_seedword(seed,1),S2=rd_seedword(seed,2),S3=rd_seedword(seed,3);
-    uint64_t x=((uint64_t)idx*0xd6e8feb86659fd93ULL)^(K+0xa0761d6478bd642fULL)^S0
-              ^(S1+0x9e3779b97f4a7c15ULL)^rotl64(S2,17)^rotr64(S3,11);
-    return splitmix64(x);
-}
-static uint64_t getter(const sn_profile_t *c,uint32_t sel){
-    switch(sel){
-        case 0: case 1: case 14: case 15: case 33: case 34: return c->s_ctxA8;
-        case 2: return c->s_ctx120;
-        case 3: case 16: case 17: case 18: case 19: case 20: return c->s_ctx60;
-        case 21: case 22: case 23: case 24: case 25: case 26: case 38: case 39: return c->s_ctx108;
-        case 28: case 29: case 30: case 31: case 32: case 35: case 36: case 37: return c->s_ctx138;
-        default: return c->s_ctxC0;
-    }
-}
-static uint64_t wymix(uint64_t a,uint32_t sel,uint32_t seq,uint32_t round){
-    uint64_t rcx=(uint64_t)round*0x589965cc75374cc3ULL+0x33a213ec50ffe2e9ULL;
-    uint64_t rsi=(uint64_t)sel*0x9e3779b97f4a7c15ULL;
-    uint64_t rdx=(uint64_t)seq*0xe7037ed1a0b428dbULL+0x8f3907f7b2b80c35ULL;
-    uint64_t s=splitmix64(a^rcx^rsi^rdx);
-    return (uint32_t)(s^(s>>32));
-}
-static uint32_t sn_prng(const sn_profile_t *c,uint32_t sel,uint32_t seq,uint32_t round){
-    return (uint32_t)wymix(getter(c,sel),sel,seq,round);
-}
-static uint32_t range_map(uint32_t v,uint16_t lo,uint16_t hi){
-    if(!(hi>lo)) return lo; return lo+(v%((uint32_t)hi-(uint32_t)lo+1u));
-}
 
 int sn_profile_init(sn_profile_t *pf, const char *psk) {
     memset(pf, 0, sizeof(*pf));
     strncpy(pf->psk, psk, sizeof(pf->psk)-1);
     pf->psk_len = strlen(pf->psk);
 
-    uint8_t buf[24+512]; size_t pl = pf->psk_len; if (pl>512) pl=512;
-    memcpy(buf, PREFIX24, 24); memcpy(buf+24, pf->psk, pl);
-    crypto_generichash(pf->seed, 32, buf, 24+pl, NULL, 0);   /* BLAKE2b-256 */
+    sn_prng_init(&pf->prng, psk);   /* seed (BLAKE2b) + sub-states, in snell_prng.c */
 
-    pf->s_ctxC0  = subseed(pf->seed, 5,    0xb46c2e7d9a1538f1ULL);
-    pf->s_ctxA8  = subseed(pf->seed, 0,    0x5d9217c083e64ab9ULL);
-    pf->s_ctx120 = subseed(pf->seed, 2,    0xa71f0c54d8396e2bULL);
-    pf->s_ctxE8  = subseed(pf->seed, 3,    0x3e8a91b52740f6cdULL);
-    pf->s_ctx60  = subseed(pf->seed, 0x10, 0xc9f4260b7d1e835aULL);
-    pf->s_ctx108 = subseed(pf->seed, 0x15, 0x62d0b5e19c4a783fULL);
-    pf->s_ctx138 = subseed(pf->seed, 0x1c, 0x917b3c48e6a205d4ULL);
-
-    pf->pad_lo = (uint16_t)range_map(sn_prng(pf,0x0e,0,0), 8, 0x50);
-    pf->pad_hi = (uint16_t)(pf->pad_lo + range_map(sn_prng(pf,0x0f,0,0), 0x10, 0xa0));
+    pf->pad_lo = (uint16_t)sn_range_map(sn_prng(&pf->prng,0x0e,0,0), 8, 0x50);
+    pf->pad_hi = (uint16_t)(pf->pad_lo + sn_range_map(sn_prng(&pf->prng,0x0f,0,0), 0x10, 0xa0));
     if (pf->pad_hi > 0x80) pf->pad_hi = 0x80;
     if (pf->pad_lo > pf->pad_hi) pf->pad_lo = pf->pad_hi;
 
-    pf->deint_mode   = (int)(sn_prng(pf,0x10,0,0) % 3u);
-    pf->deint_rounds = (int)range_map(sn_prng(pf,0x11,0,0), 1, 3);
-    pf->stride_base  = (int)range_map(sn_prng(pf,0x12,0,0), 2, 0x0d);
-    pf->phase_seed   = (int)range_map(sn_prng(pf,0x13,0,0), 0, 0x0f);
-    pf->block_P      = (int)range_map(sn_prng(pf,0x14,0,0), 8, 0x40);  /* mode 1 */
+    pf->deint_mode   = (int)(sn_prng(&pf->prng,0x10,0,0) % 3u);
+    pf->deint_rounds = (int)sn_range_map(sn_prng(&pf->prng,0x11,0,0), 1, 3);
+    pf->stride_base  = (int)sn_range_map(sn_prng(&pf->prng,0x12,0,0), 2, 0x0d);
+    pf->phase_seed   = (int)sn_range_map(sn_prng(&pf->prng,0x13,0,0), 0, 0x0f);
+    pf->deint_block_len      = (int)sn_range_map(sn_prng(&pf->prng,0x14,0,0), 8, 0x40);  /* mode 1 */
 
     /* pad-content shaping params (sel 0x06 rounds 0..6, plus 0x0c/0x0d for mode 0) */
-    pf->pad_mode   = (int)(sn_prng(pf,0x06,0,0) & 3u);
-    pf->pad_m1_wA  = (int)range_map(sn_prng(pf,0x06,0,1), 0x18, 0x80);
-    pf->pad_m1_wB  = (int)range_map(sn_prng(pf,0x06,0,2), 0x10, 0x60);
-    pf->pad_m1_wC  = (int)range_map(sn_prng(pf,0x06,0,3), 0x10, 0x60);
-    pf->pad_m2_off = (int)range_map(sn_prng(pf,0x06,0,4), 0, 9);
-    pf->pad_m3_base   = (int)range_map(sn_prng(pf,0x06,0,5), 1, 8);     /* round 5 -> base */
-    pf->pad_m3_period = (int)range_map(sn_prng(pf,0x06,0,6), 7, 0x17);  /* round 6 -> period */
-    pf->pad_m0_step = (int)range_map(sn_prng(pf,0x0c,0,0), 0x18, 0x29);
-    pf->pad_m0_span = (int)range_map(sn_prng(pf,0x0d,0,0), 0x3a, 0x4c);
+    pf->pad_mode   = (int)(sn_prng(&pf->prng,0x06,0,0) & 3u);
+    pf->pad_m1_wA  = (int)sn_range_map(sn_prng(&pf->prng,0x06,0,1), 0x18, 0x80);
+    pf->pad_m1_wB  = (int)sn_range_map(sn_prng(&pf->prng,0x06,0,2), 0x10, 0x60);
+    pf->pad_m1_wC  = (int)sn_range_map(sn_prng(&pf->prng,0x06,0,3), 0x10, 0x60);
+    pf->pad_m2_off = (int)sn_range_map(sn_prng(&pf->prng,0x06,0,4), 0, 9);
+    pf->pad_m3_base   = (int)sn_range_map(sn_prng(&pf->prng,0x06,0,5), 1, 8);     /* round 5 -> base */
+    pf->pad_m3_period = (int)sn_range_map(sn_prng(&pf->prng,0x06,0,6), 7, 0x17);  /* round 6 -> period */
+    pf->pad_m0_step = (int)sn_range_map(sn_prng(&pf->prng,0x0c,0,0), 0x18, 0x29);
+    pf->pad_m0_span = (int)sn_range_map(sn_prng(&pf->prng,0x0d,0,0), 0x3a, 0x4c);
 
     /* chunk-size selection (sel 0x15-0x1a) and inter-pad cadence (sel 0x09/0x0a/0x0b) */
-    pf->chunk_mode   = (int)(sn_prng(pf,0x15,0,0) % 3u);
-    pf->chunk_max    = (int)range_map(sn_prng(pf,0x17,0,0), 0x2000, 0x3fff);
-    pf->chunk_min    = (int)range_map(sn_prng(pf,0x16,0,0), 0x200, 0x5b4);
-    pf->chunk_jitter = (int)range_map(sn_prng(pf,0x19,0,0), 0x10, 0xc0);
+    pf->chunk_mode   = (int)(sn_prng(&pf->prng,0x15,0,0) % 3u);
+    pf->chunk_max    = (int)sn_range_map(sn_prng(&pf->prng,0x17,0,0), 0x2000, 0x3fff);
+    pf->chunk_min    = (int)sn_range_map(sn_prng(&pf->prng,0x16,0,0), 0x200, 0x5b4);
+    pf->chunk_jitter = (int)sn_range_map(sn_prng(&pf->prng,0x19,0,0), 0x10, 0xc0);
     if (pf->chunk_jitter > 0xb6) pf->chunk_jitter = 0xb6;
     for (int i = 0; i < 8; i++) {
-        int v = (int)range_map(sn_prng(pf,0x1a,0,(uint32_t)i), 0x1000, (uint16_t)pf->chunk_max);
+        int v = (int)sn_range_map(sn_prng(&pf->prng,0x1a,0,(uint32_t)i), 0x1000, (uint16_t)pf->chunk_max);
         if (v < 0x400) v = 0x1000;
         pf->chunk_hist[i] = v;
     }
-    pf->chunk_grow = (int)range_map(sn_prng(pf,0x18,0,0), 0x400, 0x1000);  /* ramp step */
+    pf->chunk_grow = (int)sn_range_map(sn_prng(&pf->prng,0x18,0,0), 0x400, 0x1000);  /* ramp step */
     if (pf->chunk_grow > 0xb68) pf->chunk_grow = 0xb68;                    /* clamp 0x3a615 */
-    pf->cad_div    = (int)range_map(sn_prng(pf,0x0a,0,0), 2, 0x0b);
-    pf->cad_thresh = (int)range_map(sn_prng(pf,0x0b,0,0), 0x60, 0x300);
+    pf->cadence_period    = (int)sn_range_map(sn_prng(&pf->prng,0x0a,0,0), 2, 0x0b);
+    pf->cadence_payload_max = (int)sn_range_map(sn_prng(&pf->prng,0x0b,0,0), 0x60, 0x300);
 
     /* inter-pad length pipeline (pad-to-target-size) params */
-    int s07 = (int)range_map(sn_prng(pf,0x07,0,0), 0x18, 0xa0);
-    pf->inter_hi = s07 + (int)range_map(sn_prng(pf,0x08,0,0), 0xa0, 0x3c0);
+    int s07 = (int)sn_range_map(sn_prng(&pf->prng,0x07,0,0), 0x18, 0xa0);
+    pf->inter_hi = s07 + (int)sn_range_map(sn_prng(&pf->prng,0x08,0,0), 0xa0, 0x3c0);
     if (pf->inter_hi > 0x2da) pf->inter_hi = 0x2da;
     pf->inter_lo = s07 < pf->inter_hi ? s07 : pf->inter_hi;
-    for (int i = 0; i < 8; i++) pf->sztbl_e[i] = (int)range_map(sn_prng(pf,0x1e,0,(uint32_t)i), 0x140, 0x5b4);
-    for (int i = 0; i < 8; i++) pf->sztbl_f[i] = (int)range_map(sn_prng(pf,0x1f,0,(uint32_t)i), 0x168, 0x5b4);
-    pf->f_b4  = (int)(sn_prng(pf,0x1c,0,0) % 3u);
-    pf->f149  = (int)range_map(sn_prng(pf,0x1d,0,0), 4, 8);
-    pf->f114  = (int)range_map(sn_prng(pf,0x20,0,0), 8, 0x60);
-    pf->f11e  = (int)range_map(sn_prng(pf,0x1c,0,0x504c), 8, 0x30);
+    for (int i = 0; i < 8; i++) pf->inter_sz_rand[i] = (int)sn_range_map(sn_prng(&pf->prng,0x1e,0,(uint32_t)i), 0x140, 0x5b4);
+    for (int i = 0; i < 8; i++) pf->inter_sz_seq[i] = (int)sn_range_map(sn_prng(&pf->prng,0x1f,0,(uint32_t)i), 0x168, 0x5b4);
+    pf->inter_jitter_mode  = (int)(sn_prng(&pf->prng,0x1c,0,0) % 3u);
+    pf->inter_warmup_seqs  = (int)sn_range_map(sn_prng(&pf->prng,0x1d,0,0), 4, 8);
+    pf->inter_jitter_span  = (int)sn_range_map(sn_prng(&pf->prng,0x20,0,0), 8, 0x60);
+    pf->inter_target_pct  = (int)sn_range_map(sn_prng(&pf->prng,0x1c,0,0x504c), 8, 0x30);
     /* chunk-ramp idle-reset gap, in SECONDS (server init 0x3a3dd-0x3a407 -> ctx+0x144).
      * Used by the tunnel: a write-pass starting >idle_gap_s wall-seconds after the prior
      * one resets the running chunk target to chunk_min (server RVA 0x3bb40-0x3bb5b). */
-    pf->idle_gap_s = (int)range_map(sn_prng(pf,0x1b,0,0), 0xc, 0x5a);
+    pf->idle_gap_s = (int)sn_range_map(sn_prng(&pf->prng,0x1b,0,0), 0xc, 0x5a);
 
-    /* salt obfuscation — derived from the PSK (general, any PSK) */
+    /* salt-obfuscation params from the shared PRNG (snell_salt.c) */
     uint32_t bl = 0;
-    snell_salt_from_psk((const uint8_t*)pf->psk, pf->psk_len, &bl, pf->salt_S, pf->salt_PRF);
+    sn_salt_derive(&pf->prng, &bl, pf->salt_S, pf->salt_PRF);
     pf->salt_block_len = (int)bl;
     return 0;
 }
@@ -147,11 +92,11 @@ void sn_salt_deobfuscate(const sn_profile_t *pf, const uint8_t *block, uint8_t r
 
 int sn_shape_prefix_len(const sn_profile_t *pf, int dir, uint32_t seq) {
     (void)dir;   /* both directions share the profile; caller keeps per-dir seq */
-    return (int)range_map(sn_prng(pf, 0x21, seq, 0), pf->pad_lo, pf->pad_hi);
+    return (int)sn_range_map(sn_prng(&pf->prng, 0x21, seq, 0), pf->pad_lo, pf->pad_hi);
 }
 
 /* Inter-pad length = the server's EXACT pad-to-target-size pipeline, implemented
- * byte-for-byte in inter_pad_len.c (two independent reconstructions agree across
+ * byte-for-byte in snell_inter_pad.c (two independent reconstructions agree across
  * 2880 differential inputs + 2117 live records). This is a thin alias for the
  * existing call sites. Handles cadence internally (may return 0). */
 int sn_shape_inter_len(const sn_profile_t *pf, uint32_t seq, int payload, int prior) {
@@ -167,9 +112,9 @@ int sn_shape_chunk_len(const sn_profile_t *pf, uint32_t seq, int remaining, uint
     uint32_t tgt = *target ? *target : (uint16_t)pf->chunk_min;   /* 0x39611 seed-from-min */
     int picked;
     switch (pf->chunk_mode) {
-    case 1:  picked = pf->chunk_hist[sn_prng(pf,0x26,seq,tgt) % 8u]; break;   /* 0x39680 */
+    case 1:  picked = pf->chunk_hist[sn_prng(&pf->prng,0x26,seq,tgt) % 8u]; break;   /* 0x39680 */
     case 2:  { int span = 2*pf->chunk_jitter + 1;                             /* 0x396dd */
-               int off = (int)(sn_prng(pf,0x27,seq,tgt) % (uint32_t)span) - pf->chunk_jitter;
+               int off = (int)(sn_prng(&pf->prng,0x27,seq,tgt) % (uint32_t)span) - pf->chunk_jitter;
                int val = (int)tgt + off;                                      /* 0x396e7 */
                picked = (val >= 0x40) ? val : 0x40; break; }                  /* 0x396f0 */
     default: picked = (int)tgt; break;                                        /* mode 0 ramp */
@@ -191,12 +136,6 @@ void sn_shape_chunk_reset(const sn_profile_t *pf, uint16_t *target) {
     *target = (uint16_t)pf->chunk_min;
 }
 
-int sn_shape_emit_pad(const sn_profile_t *pf, uint32_t seq) {
-    if ((int)seq > pf->cad_thresh) return 1;            /* later chunks always padded */
-    int d = pf->cad_div < 1 ? 1 : pf->cad_div;
-    return seq != 0 && (seq % (uint32_t)d) == 0;        /* early chunks: every d-th */
-}
-
 /* map_byte: lo + (b % (hi-lo+1)) — the server's pad-content range mapper (8-bit). */
 static uint8_t map_byte(uint8_t b, int lo, int hi) {
     if (hi <= lo) return (uint8_t)lo;
@@ -215,16 +154,17 @@ static const uint8_t SN_GF_TBL[128] = {
  0xfe,0xfd,0xfb,0xf7,0xef,0xdf,0xbf,0x7f,0xfe,0xfd,0xfb,0xf7,0xef,0xdf,0xbf,0x7f};
 
 /* stream_fill (RVA 0x38d20): deterministic keystream, len baked into the seed.
- * sel=0 -> getter(0)=s_ctxA8 (pad base); sel=2 -> getter(2)=s_ctx120 (mode-3 scratch). */
+ * sel=0 draws from the pad-base sub-state (s_ctxA8); sel=2 from the mode-3
+ * scratch sub-state (s_ctx120). */
 static void stream_fill(const sn_profile_t *pf, uint32_t sel, uint32_t seq, uint8_t *dest, int len) {
-    uint64_t g = (sel == 2) ? pf->s_ctx120 : pf->s_ctxA8;
+    uint64_t g = (sel == 2) ? pf->prng.s_ctx120 : pf->prng.s_ctxA8;
     uint64_t S = (0xb57de1f3f82cb33fULL + (uint64_t)seq * 0xd6e8feb86659fd93ULL)
                ^ ((uint64_t)sel * 0xa24baed4963ee407ULL)
                ^ ((uint64_t)(uint32_t)len * 0x165667b19e3779f9ULL + 0x0d4cd3e7b14a36d7ULL)
                ^ g;
     for (int off = 0; off < len; ) {
         S += 0x9e3779b97f4a7c15ULL;
-        uint64_t w = splitmix64(S);
+        uint64_t w = sn_splitmix64(S);
         for (int b = 0; b < 8 && off < len; b++, off++) dest[off] = (uint8_t)(w >> (8*b));
     }
 }
@@ -255,7 +195,7 @@ void sn_fill_pad(const sn_profile_t *pf, int dir, uint32_t seq, uint8_t *dest, i
         }
         break; }
     case 0: {  /* GF-table byte-walk */
-        int v = (int)range_map(sn_prng(pf,1,seq,0), pf->pad_m0_step, pf->pad_m0_span);
+        int v = (int)sn_range_map(sn_prng(&pf->prng,1,seq,0), pf->pad_m0_step, pf->pad_m0_span);
         int e = (v & 0xff) << 3;
         int k = (e <= 0x31) ? 1 : (e > 0x2ed) ? 7 : (e + 0x32)/100;
         if (k < 1) k = 1; if (k > 7) k = 7;
@@ -292,7 +232,7 @@ void sn_deinterleave(const sn_profile_t *pf, int dir, uint32_t seq,
         /* block-swap: each round k swaps P-byte blocks at indices with
          * parity (k&1) between A and B. Composed of commuting involutions,
          * so replaying the same rounds both permutes (send) & de-permutes. */
-        int P = pf->block_P; if (P <= 0) P = 1;
+        int P = pf->deint_block_len; if (P <= 0) P = 1;
         int nblk = L / P;
         for (int k = 0; k < pf->deint_rounds; k++) {
             int parity = k & 1;
@@ -310,7 +250,7 @@ void sn_deinterleave(const sn_profile_t *pf, int dir, uint32_t seq,
         int stride = pf->stride_base + (r % 3); if (stride <= 0) stride = 1;
         int phase;
         if (pf->deint_mode == 2) {
-            uint32_t pv = sn_prng(pf, 3, seq, (uint32_t)r);
+            uint32_t pv = sn_prng(&pf->prng, 3, seq, (uint32_t)r);
             phase = (int)(((uint64_t)pv + (uint32_t)pf->phase_seed) % (uint32_t)stride);
         } else { /* mode 0 */
             phase = (int)((uint32_t)pf->phase_seed % (uint32_t)stride);

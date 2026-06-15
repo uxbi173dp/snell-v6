@@ -19,6 +19,12 @@ extern "C" {
 
 typedef struct sn_tunnel sn_tunnel_t;
 
+/* Snell request-header command byte. */
+#define SN_CMD_CONNECT     0x01   /* TCP CONNECT                                  */
+#define SN_CMD_CONNECT_HC  0x05   /* TCP CONNECT, half-close tolerant             */
+#define SN_CMD_UDP         0x06   /* native UDP (no target host/port in the header) */
+#define SN_PROTO_VERSION   0x01   /* request-header version byte                  */
+
 extern int sn_log_verbose;   /* chatty diagnostics gate (set by the proxy via -v) */
 
 /* server -> client application data (already de-shaped & decrypted) */
@@ -47,10 +53,10 @@ struct sn_tunnel {
     char            client_id[256]; /* optional multi-user id (handshake cid field) */
     uint8_t         client_id_len;
 
-    sn_profile_t    profile;
-    sn_params_t     params;         /* AES-128-GCM, etc. */
-    uint8_t         key_cs[32];     /* client->server key */
-    uint8_t         key_sc[32];     /* server->client key (after server salt) */
+    const sn_profile_t *profile;    /* PSK-derived shaping profile, owned by the caller
+                                     * (one profile per PSK, shared across all tunnels) */
+    uint8_t         key_cs[SN_KEY_LEN];   /* client->server key */
+    uint8_t         key_sc[SN_KEY_LEN];   /* server->client key (after server salt) */
     void           *tx_aead_ctx;    /* cached EVP ctx for key_cs (seal); built once */
     void           *rx_aead_ctx;    /* cached EVP ctx for key_sc (open); built once */
 
@@ -95,7 +101,7 @@ struct sn_tunnel {
 
 /* Start a tunnel: resolve+connect to server, send handshake for target. */
 int sn_tunnel_open(sn_tunnel_t *t, uv_loop_t *loop,
-                   const char *server_host, int server_port, const char *psk,
+                   const char *server_host, int server_port, const sn_profile_t *profile,
                    const char *target_host, int target_port, uint8_t cmd,
                    sn_tun_data_cb on_data, sn_tun_ready_cb on_ready,
                    sn_tun_close_cb on_close, void *user);

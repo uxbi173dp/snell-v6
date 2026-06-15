@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "snell_prng.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,7 +34,7 @@ typedef struct {
     int      deint_mode;     /* 0=stride/const-phase, 1=block-swap, 2=stride/PRNG-phase */
     int      stride_base;    /* modes 0/2: stride = stride_base + round%3 */
     int      phase_seed;     /* modes 0/2: phase offset */
-    int      block_P;        /* mode 1: block size for block-swap (sel 0x14, [8,64]) */
+    int      deint_block_len;        /* mode 1: block size for block-swap (sel 0x14, [8,64]) */
     int      deint_rounds;   /* R */
     uint16_t pad_lo, pad_hi; /* prefix-pad bounds (clamped) */
 
@@ -51,20 +52,24 @@ typedef struct {
     int      chunk_max, chunk_min, chunk_jitter;
     int      chunk_grow;                         /* per-record ramp step (sel 0x18, [0x400,0x1000] clamp 0xb68) */
     int      chunk_hist[8];                      /* mode 1 size pool */
-    /* inter-pad cadence (whether a chunk carries an inter-pad region) */
-    int      cad_div, cad_thresh;
+    /* inter-pad cadence: whether a chunk carries an inter-pad region */
+    int      cadence_period;       /* pad every cadence_period-th chunk (ctx+0xf6, sel 0x0a) */
+    int      cadence_payload_max;  /* also pad any chunk with payload <= this (ctx+0x12c, sel 0x0b) */
     /* inter-pad LENGTH pipeline (pad each record toward a profile target size) */
-    int      inter_lo, inter_hi;     /* stage1 base bounds (sel 0x07/0x08) */
-    int      sztbl_e[8], sztbl_f[8]; /* size tables (sel 0x1e / 0x1f) */
-    int      f_b4, f149, f114, f11e; /* table-switch / jitter / expansion params */
+    int      inter_lo, inter_hi;   /* stage1 base bounds (sel 0x07/0x08) */
+    int      inter_sz_rand[8];     /* stage2 size table, PRNG-indexed     (ctx+0x68, sel 0x1e) */
+    int      inter_sz_seq[8];      /* stage2 size table, seq-indexed (warmup) (ctx+0xd6, sel 0x1f) */
+    int      inter_jitter_mode;    /* stage2 jitter mode 0/1/2; mode 2 jitters r10 (ctx+0xb4, sel 0x1c) */
+    int      inter_warmup_seqs;    /* first N seqs index inter_sz_seq directly (ctx+0x149, sel 0x1d) */
+    int      inter_jitter_span;    /* stage2 jitter half-span (ctx+0x114, sel 0x20) */
+    int      inter_target_pct;     /* stage2 target = pct*total/100, capped at 0x2da (ctx+0x11e, sel 0x1c/0x504c) */
     int      idle_gap_s;             /* s2c/c2s chunk-ramp idle-reset threshold, SECONDS
                                       * (server ctx+0x144 = range_map(prng(0x1b,0,0),0xc,0x5a)).
                                       * If wall-clock seconds since the previous write-pass
                                       * exceed this, the running chunk target resets to chunk_min. */
 
-    /* PRNG sub-states seeded from BLAKE2b(PREFIX24||PSK) */
-    uint8_t  seed[32];
-    uint64_t s_ctx60, s_ctxA8, s_ctxC0, s_ctx108, s_ctx120, s_ctx138, s_ctxE8;
+    /* shaping-PRNG core (seed + sub-states), shared by inter-pad & salt */
+    sn_prng_t prng;
 
     char     psk[256];
     size_t   psk_len;
@@ -96,11 +101,6 @@ int  sn_shape_chunk_len(const sn_profile_t *pf, uint32_t seq, int remaining, uin
 void sn_shape_chunk_advance(const sn_profile_t *pf, uint16_t *target);
 /* Seed a fresh stream's running target to chunk_min (server RVA 0x3b9cb). */
 void sn_shape_chunk_reset(const sn_profile_t *pf, uint16_t *target);
-/* Whether chunk `seq` should carry an inter-pad region (profile cadence).
- * DEAD: the exact cadence now lives inside inter_pad_len(); kept for the
- * standalone capture tools only. Do not use in the encode path. */
-int sn_shape_emit_pad(const sn_profile_t *pf, uint32_t seq);
-
 /* Fill `dest[0..len)` with profile-shaped padding content for chunk `seq`,
  * matching the per-PSK pad distribution the server uses (DPI resistance).
  * Round-trips regardless of content (pad is AAD, sender-chosen, unvalidated). */
@@ -110,7 +110,7 @@ void sn_fill_pad(const sn_profile_t *pf, int dir, uint32_t seq, uint8_t *dest, i
  * (byte-validated, two independent reconstructions). Depends on the chunk's
  * `payload` length and `prior` (bytes already emitted in this write before this
  * chunk — salt_block_len before handshake chunk 0, else 0). Handles cadence
- * internally (may return 0). Implemented in inter_pad_len.c. */
+ * internally (may return 0). Implemented in snell_inter_pad.c. */
 int inter_pad_len(const sn_profile_t *pf, uint32_t seq, int payload, int prior);
 /* Thin alias kept for existing call sites. */
 int sn_shape_inter_len(const sn_profile_t *pf, uint32_t seq, int payload, int prior);
