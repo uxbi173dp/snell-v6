@@ -1,13 +1,13 @@
 # Snell v6 (b3) client
 
-An opensource reimplementation of the Surge **Snell v6 (beta3)** tunneling protocol
-(client side), reverse-engineered from the reference server binary and verified end-to-end
-against a live server.
+An opensource implementation of the Surge **Snell v6 (beta3)** tunneling protocol
+(client side only).
 
 ## Build & run
 ```
 make
-./snell-proxy --server <host> --server-port <port> --psk <psk> --socks5 1080 [--http 8080]
+./snell-proxy --server <host> --server-port <port> --psk <psk> \
+  --socks5 1080 [--http 8080] [--mode default|unshaped|unsafe-raw]
 
 # test
 curl --socks5 127.0.0.1:1080 -o /dev/null https://hil-speed.hetzner.com/1GB.bin
