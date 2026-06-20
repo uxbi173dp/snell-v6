@@ -1,6 +1,6 @@
-# Snell v6 (b2) client
+# Snell v6 (b3) client
 
-An opensource reimplementation of the Surge **Snell v6 (beta2)** tunneling protocol
+An opensource reimplementation of the Surge **Snell v6 (beta3)** tunneling protocol
 (client side), reverse-engineered from the reference server binary and verified end-to-end
 against a live server.
 
