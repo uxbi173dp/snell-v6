@@ -1,4 +1,4 @@
-# Snell v6 (b2) client — FINAL product.
+# Snell v6 (b3) client — FINAL product.
 # Builds the deliverable proxy `snell-proxy` (SOCKS5 + HTTP CONNECT front ends,
 # full byte-exact Snell v6 shaping). See PROTOCOL.md / PROTOCOL_RFC.md.
 UNAME_S := $(shell uname -s)
