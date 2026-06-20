@@ -63,6 +63,7 @@ typedef struct {
 #endif
 
 static int g_shape_out = 1;  /* outbound traffic shaping (--no-shape disables) */
+static int g_mode = SN_MODE_DEFAULT;  /* --mode default|unshaped|unsafe-raw (must match server) */
 static uint8_t g_connect_cmd = SN_CMD_CONNECT;  /* TCP CONNECT; --connect-cmd 5 selects SN_CMD_CONNECT_HC (half-close tolerant) */
 static char g_client_id[256] = ""; static uint8_t g_client_id_len = 0;  /* --client-id */
 static int g_tcp_fastopen = 0;  /* --tcp-fastopen: TFO for the client->server connection */
@@ -404,7 +405,7 @@ static void start_tunnel(conn_t *c){
     uv_read_stop((uv_stream_t*)&c->client);
     PLOG("[proxy] %s %s:%d\n", c->L->is_socks?"SOCKS5":"CONNECT", c->target_host, c->target_port);
     int rc = sn_tunnel_open(&c->tunnel, c->loop, c->L->server, c->L->server_port, c->L->profile,
-                       c->target_host, c->target_port, g_connect_cmd,
+                       c->target_host, c->target_port, g_connect_cmd, g_mode,
                        on_tun_data, on_tun_ready, on_tun_close, c);
     c->tunnel.shape_out = g_shape_out;
     c->tunnel.tcp_fastopen = g_tcp_fastopen;
@@ -430,7 +431,7 @@ static void start_udp_associate(conn_t *c){
     if (uv_udp_bind(&c->udp,(const struct sockaddr*)&ba,0)!=0){ PLOG("[proxy] udp bind failed\n"); conn_close(c); return; }
     PLOG("[proxy] SOCKS5 UDP ASSOCIATE -> snell udp (cmd 0x06)\n");
     int rc=sn_tunnel_open(&c->tunnel,c->loop,c->L->server,c->L->server_port,c->L->profile,
-                          "",0,SN_CMD_UDP, on_tun_data,on_tun_ready,on_tun_close,c);
+                          "",0,SN_CMD_UDP, g_mode, on_tun_data,on_tun_ready,on_tun_close,c);
     c->tunnel.shape_out = g_shape_out;
     c->tunnel.tcp_fastopen = g_tcp_fastopen;
     c->tunnel.on_tcp_closed_cb = on_tun_tcp_closed;
@@ -526,15 +527,21 @@ int main(int argc,char**argv){
     static struct option lo[]={{"server",1,0,'s'},{"server-port",1,0,'p'},{"psk",1,0,'k'},
         {"socks5",1,0,'S'},{"http",1,0,'H'},{"listen",1,0,'l'},{"no-socks5",0,0,'A'},{"no-http",0,0,'B'},
         {"no-shape",0,0,'N'},{"connect-cmd",1,0,'C'},{"client-id",1,0,'I'},{"verbose",0,0,'v'},
-        {"tcp-fastopen",0,0,'F'},{0,0,0,0}};
+        {"tcp-fastopen",0,0,'F'},{"mode",1,0,'m'},{0,0,0,0}};
     int o; while((o=getopt_long(argc,argv,"s:p:k:S:H:l:v",lo,0))!=-1){ switch(o){
         case 's':strncpy(server,optarg,255);break; case 'p':sport=atoi(optarg);break; case 'k':strncpy(psk,optarg,255);break;
         case 'S':socks_port=atoi(optarg);break; case 'H':http_port=atoi(optarg);break; case 'l':strncpy(listen_addr,optarg,63);break;
         case 'A':en_socks=0;break; case 'B':en_http=0;break; case 'N':g_shape_out=0;break;
         case 'C':g_connect_cmd=(atoi(optarg)==5)?SN_CMD_CONNECT_HC:SN_CMD_CONNECT;break;
         case 'I':{ strncpy(g_client_id,optarg,255); size_t n=strlen(g_client_id); g_client_id_len=(uint8_t)(n>255?255:n); break; }
-        case 'v':sn_log_verbose=1;break; case 'F':g_tcp_fastopen=1;break; } }
-    if(!server[0]||!psk[0]||!sport){ fprintf(stderr,"usage: %s --server H --server-port P --psk K [--socks5 1080] [--http 8080]\n",argv[0]); return 1; }
+        case 'v':sn_log_verbose=1;break; case 'F':g_tcp_fastopen=1;break;
+        case 'm':
+            if(!strcasecmp(optarg,"default")) g_mode=SN_MODE_DEFAULT;
+            else if(!strcasecmp(optarg,"unshaped")) g_mode=SN_MODE_UNSHAPED;
+            else if(!strcasecmp(optarg,"unsafe-raw")) g_mode=SN_MODE_UNSAFE_RAW;
+            else { fprintf(stderr,"--mode must be one of: default, unshaped, unsafe-raw\n"); return 1; }
+            break; } }
+    if(!server[0]||!psk[0]||!sport){ fprintf(stderr,"usage: %s --server H --server-port P --psk K [--socks5 1080] [--http 8080] [--mode default|unshaped|unsafe-raw]\n",argv[0]); return 1; }
 
     /* One PSK -> one profile: build the PSK-derived shaping profile once and share
      * it (read-only) across every tunnel, instead of recomputing it per connection. */

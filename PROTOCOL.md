@@ -1,9 +1,17 @@
-# Snell v6 (b2) — Complete Protocol Specification
+# Snell v6 (b3) — Complete Protocol Specification
 
-Reverse-engineered from the official Snell **server** binary `snell-server` v6.0.0b2
+Reverse-engineered from the official Snell **server** binary `snell-server` v6.0.0b3
 (stripped static PIE, x86-64) and verified end-to-end against a live server. This is a
 self-contained client-oriented spec: everything here is implemented in this directory and
 verified on a remote box across **three different PSKs** (see §15).
+
+b3 added a **`mode` setting** (`default` | `unshaped` | `unsafe-raw`; §1.1). The protocol below
+describes **`default`** mode, which is **byte-identical to b2 on the wire** — live-verified: the
+client's predicted s→c inter-pad length matches the b3 server *exactly on every record including the
+first*, across small and large payloads (`-DIPL_VERIFY`, 0 mismatches), and the unmodified b2 client
+drives a b3 default server end-to-end. (A static b2↔b3 diff suggested b3 refactored the first-record
+shaping path internally; the live check shows no resulting on-wire change, so it is **not** mirrored
+in the client.) The other two modes are deltas off this, given in §1.1.
 
 > Status legend: ✅ verified end-to-end · 🔎 verified by disassembly · ⚠️ understood, not implemented
 
@@ -32,6 +40,48 @@ The whole construction is keyed by:
 - a **salt obfuscation** scheme — deterministic from the PSK (§4);
 - a **session key** — Argon2id(PSK, per-direction salt) (§2.5, §12);
 - **AES-128-GCM** record encryption (§2.6).
+
+---
+
+## 1.1 Protocol modes (b3 `mode` setting)  ✅
+
+b3 adds a `mode` setting (server config `mode = …`; client `--mode …`) — **client and server must
+match**. It is a pure both-directions wire switch: the request header (§6) and the lazy-status reply
+(§5, §11) are mode-independent; only the salt encoding and which framing/crypto layers run differ.
+Mode is **not** derived from the PSK (it is out-of-band config). Enum: `default=0, unshaped=1,
+unsafe-raw=2` (the server stores it per-connection and, for non-default, never builds the PSK profile).
+
+| layer | `default` | `unshaped` | `unsafe-raw` |
+|---|---|---|---|
+| salt (§4) | obfuscated scatter block (`salt_block_len`) | **raw 16 bytes** | **none** |
+| session key | Argon2id(PSK, salt) | Argon2id(PSK, salt) | **none** |
+| record crypto | AES-128-GCM | AES-128-GCM | **plaintext** |
+| control record | sealed 23 B, AAD = prefix_pad | sealed 23 B, **empty AAD** | — (cleartext header) |
+| prefix_pad (§7) | `prefix_pad_len(seq)` | **0** | — |
+| inter_pad (§7) | `inter_pad_len(…)` | **0** | — |
+| de-interleave (§8) | yes | no (pad_len 0) | no |
+| pad content (§8.1) | yes | no | no |
+| chunk ramp | profile ramp | flat, ≤ `0x3fff`/rec | flat, ≤ `0x3fff`/rec |
+
+**`unshaped`** ≈ Snell v3: AES only, so after the raw salt the stream is all ciphertext+tags (looks
+random). It is *exactly* the default framing (§7) with `prefix_pad_len = inter_pad_len = 0` — both
+AEAD seals then use empty AAD and de-interleave is a no-op — plus a raw 16-byte salt instead of the
+obfuscated block. Per-direction key derivation, nonces (2/record), and control/payload sealing are
+unchanged.
+
+**`unsafe-raw`** forwards plaintext (use only inside another secure tunnel): after TCP connect the
+client sends **no salt and derives no key**; every record is a cleartext length-prefixed frame:
+```
+[0]    0x04            # frame type (DATA)
+[1..2] 0x00 0x00
+[3..4] 0x00 0x00
+[5..6] payload_len (BE16, ≤ 0x3fff)
+[7..]  payload (cleartext)
+```
+The first c→s frame's payload is the request header (§6); the first s→c frame's payload still leads
+with the status byte (§5, §11). A zero-length frame signals write-EOF (half-close).
+
+Per-record payload cap is `0x3fff` (16383 bytes) for both `unshaped` and `unsafe-raw`.
 
 ---
 
@@ -122,7 +172,7 @@ shaping params, all via `prng(sel, 0, 0)` then `range_map`:
 | `R` (rounds)   | `range_map(prng(0x11), 1, 3)`                | [1, 3]       |
 | `stride_base`  | `range_map(prng(0x12), 2, 0x0d)`             | [2, 13]      |
 | `phase_seed`   | `range_map(prng(0x13), 0, 0x0f)`             | [0, 15]      |
-| `block_P`      | `range_map(prng(0x14), 8, 0x40)`             | [8, 64]      |
+| `deint_block_len`      | `range_map(prng(0x14), 8, 0x40)`             | [8, 64]      |
 
 Per-chunk shaping lengths (direction-independent; each side keeps its own `seq` counter):
 
@@ -198,9 +248,10 @@ makes the server derive the fixed real salt `7b 82 5e 7c 55 38 f0 1b ac b1 45 00
 
 ## 5. Session handshake
 
-**Client → server (chunk 0):**
+**Client → server (chunk 0):** *(default mode; see §1.1 for `unshaped`/`unsafe-raw`)*
 1. Pick a random 16-byte `real_salt`; build the obfuscated `salt block` (§4).
-   `key_cs = Argon2id(PSK, real_salt)`.
+   `key_cs = Argon2id(PSK, real_salt)`. (`unshaped`: send the raw 16-byte salt, no block;
+   `unsafe-raw`: no salt, no key.)
 2. Send: `[salt block]` then `[chunk 0]` whose payload is the **request header** (§6),
    encoded with the chunk framing (§7), `seq = 0`, nonces 0/1.
 
@@ -283,6 +334,8 @@ Order of operations:
 
 `pad_len = 0` is legal (server reads it from the control record): no inter_pad, no
 de-interleave. The client defaults to shaped `pad_len = inter_pad_len(seq)` for stealth.
+In **`unshaped`** mode this framing is used with `prefix_pad = inter_pad = 0` (empty-AAD seals);
+**`unsafe-raw`** replaces the whole sealed frame with a cleartext length-prefixed frame (§1.1).
 
 ---
 
@@ -293,7 +346,7 @@ positions, the *same* routine both permutes (send) and de-permutes (recv).
 
 ### mode 1 — block-swap (length-derived; `stride_base`/`phase_seed` unused)
 ```
-P = max(block_P, 1);  nblk = L / P
+P = max(deint_block_len, 1);  nblk = L / P
 for k in 0..R-1:
     parity = k & 1
     for i = parity; i < nblk; i += 2:
@@ -309,7 +362,7 @@ for r in 0..R-1:
     for j = phase; j < L; j += stride:  swap A[j] <-> B[j]
 ```
 
-(`block_P` selector is `0x14`; verified general across PSKs: PSK1→44, PSK2→49, PSK3→44.)
+(`deint_block_len` selector is `0x14`; verified general across PSKs: PSK1→44, PSK2→49, PSK3→44.)
 
 ## 8.1 Pad CONTENT shaping (DPI resistance)  ✅
 
@@ -333,25 +386,25 @@ emit LE `splitmix64(S)`. getter(0)=s_ctxA8 (pad), getter(2)=s_ctx120 (mode-3 scr
 **Verified BYTE-EXACT** vs the live server's pad for all 4 modes (a mode-2, mode-1, mode-0, and
 mode-3 PSK respectively): 0 mismatches each. (Test PSKs are recorded in the project memory, not here.)
 
-**inter_pad LENGTH** (pad-to-target-size) — **BYTE-EXACT** ✅ (`inter_pad_len.c`, builder @0x3b020).
+**inter_pad LENGTH** (pad-to-target-size) — **BYTE-EXACT** ✅ (`snell_inter_pad.c`, builder @0x3b020).
 Three independent reconstructions agree (2 RE + 1 stage2-focused live capture) across 2880 differential
-inputs + 2117 live records + 6 acceptance points + 37 live captures covering `f_b4`∈{0,1,2}; a local
+inputs + 2117 live records + 6 acceptance points + 37 live captures covering `inter_jitter_mode`∈{0,1,2}; a local
 differential harness confirms 35,280 cases, 0 mismatches. The pipeline:
 ```
 cadence(seq,payload): field09(sel 0x09,[2,8]) > seq → 1            # early chunks always pad
-                      else cad_div≠0 && seq%cad_div==0   → 1       # periodic, ALL payloads
-                      else payload≠0 → (payload ≤ cad_thresh)       # small payloads
+                      else cadence_period≠0 && seq%cadence_period==0   → 1       # periodic, ALL payloads
+                      else payload≠0 → (payload ≤ cadence_payload_max)       # small payloads
                       else 0
-   (the periodic seq%cad_div rule fires regardless of payload size — verified against the
-    live server's actual pad_len over 7,026 s→c records / 3 PSKs incl. f_b4==2, 0 mismatches.)
+   (the periodic seq%cadence_period rule fires regardless of payload size — verified against the
+    live server's actual pad_len over 7,026 s→c records / 3 PSKs incl. inter_jitter_mode==2, 0 mismatches.)
 stage1  = cadence ? range_map(prng(0x22,seq,payload), inter_lo, inter_hi) : 0
 total   = stage1 + (payload+0x17) + prefix_len(seq) + (payload?0x10:0) + prior
 stage2(total): total>0x5b3 → (total≤0xfffe ? total : 0xffff)   # either way total≥stage2 → inter=stage1
-   else: r10 = (f149>seq) ? sztbl_f[seq] : sztbl_e[prng(0x23,seq,total)%8]
-         if f_b4==2: r10 += (prng(0x24,seq,0) % (2*f114+1) - f114)   [floor 1]
-         r11 = min(0x2da, f11e*total/100)
+   else: r10 = (inter_warmup_seqs>seq) ? inter_sz_seq[seq] : inter_sz_rand[prng(0x23,seq,total)%8]
+         if inter_jitter_mode==2: r10 += (prng(0x24,seq,0) % (2*inter_jitter_span+1) - inter_jitter_span)   [floor 1]
+         r11 = min(0x2da, inter_target_pct*total/100)
          prng(0x23,seq,r11)&1 ? r10 -= r11>>1 : r10 += r11
-         while (u16)r10 < total: tv=sztbl_e[prng(0x25,seq,r10)%8];
+         while (u16)r10 < total: tv=inter_sz_rand[prng(0x25,seq,r10)%8];
                                  r10 = (r10>=tv) ? r10+inter_hi : tv     [overflow→0xffffffff]
 inter   = (total < stage2) ? stage1 + min(0x2da, stage2-total) : stage1   → (u16), range 0..0x5b4
 ```
@@ -506,7 +559,7 @@ OpenSSL strings are dead, zero xrefs). There is **nothing to negotiate**; wrong 
 |-----------------------|-----------------------------------------------------------------------|
 | `snell_crypto.{c,h}`  | Argon2id KDF, AES-128-GCM seal/open, params.                          |
 | `snell_shape.{c,h}`   | profile derivation (PRNG), prefix/inter pad lengths, de-interleave 0/1/2, pad-content shaping (`sn_fill_pad`, modes 0–3). |
-| `snell_salt_prng.c`   | general salt obfuscation (`block_len`, `S[]`, `PRF[]`) + self-test.   |
+| `snell_salt.c`   | general salt obfuscation (`block_len`, `S[]`, `PRF[]`) + self-test.   |
 | `pad_test.c`          | measures `sn_fill_pad` output distribution for a PSK (vs the server). |
 | `snell_shape_prng.c`  | stand-alone shaping-PRNG reference + self-test (not linked).          |
 | `snell_tunnel.{c,h}`  | libuv tunnel: async connect, handshake, chunk encode/decode, backpressure, datagram send. |
@@ -516,8 +569,8 @@ Performance: async libuv, offset-based RX (no per-chunk `memmove`), **bidirectio
 backpressure (s→c: pause server reads when the local-client write queue >512 KB, resume <128 KB;
 c→s: pause the local-client read when the tunnel's server-side write queue >512 KB, resume <128 KB
 via the `on_tx_drain` callback), **per-direction AEAD context reuse** (the AES-128-GCM key schedule
-is built once per direction and only the 12-byte nonce is reset per record, via `sn_aead_seal_r`/
-`sn_aead_open_r`), graceful `uv_shutdown` drain on close. Outbound shaping default-on; `--no-shape`
+is built once per direction and only the 12-byte nonce is reset per record, via `sn_aead_seal`/
+`sn_aead_open`), graceful `uv_shutdown` drain on close. Outbound shaping default-on; `--no-shape`
 disables it for raw throughput.
 
 ---
@@ -565,10 +618,10 @@ evidence, and `PADSHAPE_RE.md` for the pad-shaping RE.
   half-close churn (cmd 0x05, bidirectional + early-kill).
 - **BYTE-EXACT vs the live server:** **inter_pad length** validated the strongest way possible —
   the client's `inter_pad_len` prediction compared to the server's actual decrypted `pad_len` over
-  **7,026 s→c records / 3 PSKs incl. an f_b4==2 PSK, 0 mismatches** (build with `-DIPL_VERIFY`; this
+  **7,026 s→c records / 3 PSKs incl. an inter_jitter_mode==2 PSK, 0 mismatches** (build with `-DIPL_VERIFY`; this
   live check caught a cadence bug that 3 agreeing offline reconstructions all missed). Pad CONTENT
-  byte-exact for all 4 modes and confirmed **f_b4-independent** (150/150 on an f_b4==2/mode-0 PSK);
-  inter_pad f_b4==2 length jitter byte-exact and load-bearing (328/328 with, 28/328 without).
+  byte-exact for all 4 modes and confirmed **inter_jitter_mode-independent** (150/150 on an inter_jitter_mode==2/mode-0 PSK);
+  inter_pad inter_jitter_mode==2 length jitter byte-exact and load-bearing (328/328 with, 28/328 without).
   **chunk-size ramp** (15,908 records, 0 over-predictions; PSK1 picks reproduce the server's observed
   sizes). salt-block filler (71/71 & 58/58 non-scatter bytes). de-interleave (true involution,
   AEAD-valid after de-interleave). AEAD nonce (96-bit LE counter, cannot wrap). cmd 0x05 verified;
@@ -602,10 +655,12 @@ are all resolved:
 - **"fixed-prefix one-shot record"** → RE proved it is simply the **salt block itself** (sel 0x21@0x7053
   / bounds sel 0x0e/0x0f@0x7053: `salt_block_len = 0x10 + range_map(prng(0x21,0,0x7053), blk_lo=[0xcc],
   blk_hi=[0x130])`, `blk_hi` additive) — first record of every connection in both directions, already
-  byte-exact in `snell_salt_prng.c` (state-0 path of fn 0x3b3f0, hbreak-verified). Not a gap.
+  byte-exact in `snell_salt.c` (state-0 path of fn 0x3b3f0, hbreak-verified). Not a gap.
 - **mode-1 chunk modulus** field [0x12e] = const 8 → confirmed (§9).
 
 What's left are non-wire-behavior items only:
 - **Reserved selectors** sel 0x00, 0x04, 0x05, 0x28–0x39 are written-but-never-read or never
-  invoked in the server; correctly omitted by the client.
+  invoked in the server (full accounting in `SELECTORS_RE.md`); correctly omitted by the client.
 - **`client_id`** is supported (`--client-id`) but optional; default `cid_len=0`.
+- **TFO server side** is absent in this build (client support is in place + falls back gracefully).
+- **TLS/HTTP obfs**: v6 dropped it; not applicable (we never enable obfs).

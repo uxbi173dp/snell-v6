@@ -18,6 +18,8 @@
 #define TLOG(...) do { if (sn_log_verbose) fprintf(stderr, __VA_ARGS__); } while (0)
 
 #define TX_CHUNK_MAX 16384  /* max application bytes per client->server chunk (matches server range) */
+#define SN_RAW_CHUNK_MAX 0x3fff /* per-record payload cap for unshaped/unsafe-raw (server cap) */
+#define SN_RAW_HDR_LEN   7      /* unsafe-raw cleartext frame header: [04][00 00][00 00][len BE16] */
 
 /* Record framing. Each chunk is [prefix_pad][control][inter_pad][payload], where
  * the control record is AEAD-sealed with the prefix_pad as AAD. Control plaintext
@@ -91,6 +93,16 @@ static int tun_send_owned(sn_tunnel_t *t, uint8_t *buf, size_t len) {
     return rc;
 }
 
+/* c->s prefix/inter pad lengths for the default & unshaped AEAD record path.
+ * unshaped forces both to 0 (empty-AAD seals, de-interleave becomes a no-op);
+ * default derives them from the PSK profile. Single-sourced for encode_chunk + send_eof. */
+static void c2s_pad_lens(const sn_tunnel_t *t, uint32_t seq, int payload, int prior,
+                         int *prefix_len, int *pad_len) {
+    *prefix_len = (t->mode == SN_MODE_UNSHAPED) ? 0 : sn_shape_prefix_len(t->profile, SN_DIR_C2S, seq);
+    *pad_len    = (t->mode == SN_MODE_UNSHAPED || !t->shape_out) ? 0
+                  : sn_shape_inter_len(t->profile, seq, payload, prior);
+}
+
 /* Encode one client->server chunk for `payload` into out (caller-sized). Returns length.
  *
  * Wire: [prefix_pad][control(=AEAD of 7B, AAD=prefix_pad)][inter_pad][payload(=AEAD, AAD=inter_pad)].
@@ -99,8 +111,16 @@ static int tun_send_owned(sn_tunnel_t *t, uint8_t *buf, size_t len) {
  * de-interleaves on receive). The server reads pad_len/payload_len from the
  * control record, so this round-trips while matching the v6 traffic profile. */
 static size_t encode_chunk(sn_tunnel_t *t, uint32_t seq, const uint8_t *payload, size_t plen, uint8_t *out, int prior) {
-    int prefix_len = sn_shape_prefix_len(t->profile, SN_DIR_C2S, seq);
-    int pad_len = t->shape_out ? sn_shape_inter_len(t->profile, seq, (int)plen, prior) : 0;
+    if (t->mode == SN_MODE_UNSAFE_RAW) {   /* plaintext length-prefixed frame, no crypto/pad */
+        out[0] = SN_REC_TYPE_DATA; out[1] = out[2] = out[3] = out[4] = 0;
+        out[5] = (uint8_t)(plen>>8); out[6] = (uint8_t)(plen&0xff);
+        if (plen) memcpy(out + SN_RAW_HDR_LEN, payload, plen);
+        return SN_RAW_HDR_LEN + plen;
+    }
+    /* unshaped: AES-128-GCM record exactly as default but with NO prefix/inter pad
+     * (so control & payload seal with empty AAD; de-interleave is skipped at pad_len 0). */
+    int prefix_len, pad_len;
+    c2s_pad_lens(t, seq, (int)plen, prior, &prefix_len, &pad_len);
     size_t off = 0;
     sn_fill_pad(t->profile, SN_DIR_C2S, seq, out, prefix_len); off += prefix_len;  /* prefix pad (control AAD), profile-shaped */
     uint8_t ctl[SN_CTRL_PLAIN_LEN] = {SN_REC_TYPE_DATA, 0,0, (uint8_t)(pad_len>>8),(uint8_t)(pad_len&0xff),
@@ -121,6 +141,7 @@ static size_t encode_chunk(sn_tunnel_t *t, uint32_t seq, const uint8_t *payload,
 
 int sn_tunnel_write(sn_tunnel_t *t, const uint8_t *data, size_t len) {
     if (!t || t->closed || !t->handshook) return -1;
+    const int ramp = (t->mode == SN_MODE_DEFAULT && t->shape_out);   /* chunk-size ramp active (default mode only) */
     /* One sn_tunnel_write == one upstream read == one server "build pass": split into
      * chunk-sized records and emit them ALL in a single uv_write (nbufs=1), matching the
      * server's builder (verified RVA 0x3b990 -> one uv_write @0x3eff5). prior stays 0 for
@@ -135,7 +156,7 @@ int sn_tunnel_write(sn_tunnel_t *t, const uint8_t *data, size_t len) {
      * here so our c->s record sizes match the server's after an idle gap. Use whole
      * seconds via time(NULL) (NOT uv_now()/ms) to match the server's time_t granularity
      * exactly: the boundary is integer floor(now_s)-floor(last_s) > idle_gap_s. */
-    if (t->shape_out) {
+    if (ramp) {
         long now_s = (long)time(NULL);
         if (t->tx_last_write_s != 0 &&
             (now_s - t->tx_last_write_s) > (long)t->profile->idle_gap_s) {
@@ -150,8 +171,9 @@ int sn_tunnel_write(sn_tunnel_t *t, const uint8_t *data, size_t len) {
     if (!buf) return -1;
     while (pos < len) {
         size_t ch = len - pos;
-        int want = t->shape_out ? sn_shape_chunk_len(t->profile, t->tx_seq, (int)(len - pos), &t->tx_chunk_target)
-                                : TX_CHUNK_MAX;
+        int want = (t->mode != SN_MODE_DEFAULT) ? SN_RAW_CHUNK_MAX
+                 : (ramp ? sn_shape_chunk_len(t->profile, t->tx_seq, (int)(len - pos), &t->tx_chunk_target)
+                         : TX_CHUNK_MAX);
         if (ch > (size_t)want) ch = (size_t)want;
         if (ch > TX_CHUNK_MAX) ch = TX_CHUNK_MAX;
         size_t need = wl + 2048 + ch + 64;   /* worst-case encoded size of this record */
@@ -159,7 +181,7 @@ int sn_tunnel_write(sn_tunnel_t *t, const uint8_t *data, size_t len) {
         size_t n = encode_chunk(t, t->tx_seq++, data + pos, ch, buf + wl, 0);
         if (n == 0) { free(buf); return -1; }   /* AEAD seal failed: abort the pass */
         wl += n;
-        if (t->shape_out) sn_shape_chunk_advance(t->profile, &t->tx_chunk_target);  /* ramp per record */
+        if (ramp) sn_shape_chunk_advance(t->profile, &t->tx_chunk_target);  /* ramp per record */
         pos += ch;
     }
     return tun_send_owned(t, buf, wl);   /* single uv_write for the whole pass (no extra copy) */
@@ -170,6 +192,9 @@ int sn_tunnel_write(sn_tunnel_t *t, const uint8_t *data, size_t len) {
 int sn_tunnel_send_datagram(sn_tunnel_t *t, const uint8_t *rec, size_t len) {
     if (!t || t->closed || !t->handshook) return -1;
     if (len == 0 || len > 65535) return -1;
+    /* unshaped/unsafe-raw cap each record at SN_RAW_CHUNK_MAX; a datagram is one record and
+     * cannot be split, so reject one that would exceed the server's per-record cap. */
+    if (t->mode != SN_MODE_DEFAULT && len > SN_RAW_CHUNK_MAX) return -1;
     uint8_t *out = malloc(2048 + len + 64); if (!out) return -1;   /* prefix+control+inter_pad(≤0x5b4)+payload+tag */
     size_t n = encode_chunk(t, t->tx_seq++, rec, len, out, 0);
     if (n == 0) { free(out); return -1; }   /* AEAD seal failed */
@@ -182,8 +207,12 @@ int sn_tunnel_send_datagram(sn_tunnel_t *t, const uint8_t *rec, size_t len) {
 int sn_tunnel_send_eof(sn_tunnel_t *t) {
     if (!t || t->closed || !t->handshook) return -1;
     uint32_t seq = t->tx_seq++;
-    int prefix_len = sn_shape_prefix_len(t->profile, SN_DIR_C2S, seq);
-    int pad_len = t->shape_out ? sn_shape_inter_len(t->profile, seq, 0, 0) : 0;
+    if (t->mode == SN_MODE_UNSAFE_RAW) {   /* zero-length plaintext frame = write-EOF */
+        uint8_t f[SN_RAW_HDR_LEN];
+        return tun_send(t, f, encode_chunk(t, seq, NULL, 0, f, 0));
+    }
+    int prefix_len, pad_len;
+    c2s_pad_lens(t, seq, 0, 0, &prefix_len, &pad_len);
     uint8_t out[2048]; size_t off = 0;   /* prefix(≤0x80) + control(23) + inter_pad(≤0x5b4), no payload */
     sn_fill_pad(t->profile, SN_DIR_C2S, seq, out, prefix_len); off += prefix_len;
     uint8_t ctl[SN_CTRL_PLAIN_LEN] = {SN_REC_TYPE_DATA,0,0, (uint8_t)(pad_len>>8),(uint8_t)(pad_len&0xff), 0,0};  /* payload_len=0 */
@@ -193,18 +222,9 @@ int sn_tunnel_send_eof(sn_tunnel_t *t) {
     return tun_send(t, out, off);    /* no payload record */
 }
 
-/* Send the handshake: salt block + chunk0 carrying the request header. */
+/* Send the handshake: salt (per mode) + chunk0 carrying the request header. */
 static void send_handshake(sn_tunnel_t *t) {
-    /* client salt: random real salt -> obfuscated block; key_cs = argon2id(psk, real) */
-    uint8_t real_salt[16]; randombytes_buf(real_salt, 16);
-    uint8_t block[160];   /* salt_block_len = 0x10 + range_map(.,blk_lo,blk_hi<=0x80) <= 144 */
-    if (t->profile->salt_block_len < 16 || (size_t)t->profile->salt_block_len > sizeof block) {
-        tun_fail(t, -1); return;   /* defensive: never let a PSK-derived length overflow block[] */
-    }
-    sn_salt_obfuscate(t->profile, real_salt, block);
-    if (sn_derive_key(t->profile->psk, real_salt, t->key_cs) != 0) { tun_fail(t, -1); return; }
-
-    /* request header */
+    /* request header — identical in every mode (so is the lazy-status reply) */
     uint8_t hdr[600]; size_t hl = 0;
     hdr[hl++] = SN_PROTO_VERSION; hdr[hl++] = t->cmd;          /* version, cmd */
     hdr[hl++] = t->client_id_len;                              /* client-id len */
@@ -215,19 +235,39 @@ static void send_handshake(sn_tunnel_t *t) {
         hdr[hl++] = (uint8_t)(t->target_port>>8); hdr[hl++] = (uint8_t)(t->target_port&0xff);
     }
 
-    /* seed the chunk-size ramp: chunk 0 is wire record 0 on a fresh stream (server
-     * RVA 0x3b9cb seeds the running target to chunk_min before the first record). */
-    if (t->shape_out) sn_shape_chunk_reset(t->profile, &t->tx_chunk_target);
+    if (t->mode == SN_MODE_UNSAFE_RAW) {   /* no salt, no keys: cleartext request frame */
+        uint8_t wire[700];
+        size_t n = encode_chunk(t, t->tx_seq++, hdr, hl, wire, 0);
+        if (n == 0) { tun_fail(t, -1); return; }
+        tun_send(t, wire, n);
+        t->handshook = 1;
+        return;
+    }
 
+    /* default & unshaped: random real salt -> key_cs = argon2id(psk, salt) */
+    uint8_t real_salt[16]; randombytes_buf(real_salt, 16);
     uint8_t wire[4096]; size_t wl = 0;   /* salt + prefix + control + inter_pad(≤0x5b4) + hdr(≤516) + tag */
-    memcpy(wire, block, t->profile->salt_block_len); wl += t->profile->salt_block_len;
-    /* chunk 0; prior = the salt block already in this buffer (matches the server's accounting) */
-    size_t n = encode_chunk(t, t->tx_seq++, hdr, hl, wire + wl, t->profile->salt_block_len);
+    if (t->mode == SN_MODE_UNSHAPED) {
+        memcpy(wire, real_salt, 16); wl = 16;                  /* raw 16-byte salt, no obfuscation block */
+    } else {                                                   /* default: obfuscated salt block */
+        if (t->profile->salt_block_len < 16 || (size_t)t->profile->salt_block_len > 160) {
+            tun_fail(t, -1); return;   /* defensive: never let a PSK-derived length overflow wire[] */
+        }
+        sn_salt_obfuscate(t->profile, real_salt, wire); wl = t->profile->salt_block_len;
+    }
+    if (sn_derive_key(t->profile->psk, real_salt, t->key_cs) != 0) { tun_fail(t, -1); return; }
+
+    const int ramp = (t->mode == SN_MODE_DEFAULT && t->shape_out);   /* chunk-size ramp active (default mode only) */
+    /* seed the chunk-size ramp (default mode only): chunk 0 is wire record 0 on a fresh stream
+     * (server RVA 0x3b9cb seeds the running target to chunk_min before the first record). */
+    if (ramp) sn_shape_chunk_reset(t->profile, &t->tx_chunk_target);
+    /* chunk 0; prior = the salt bytes already in this buffer (matches the server's accounting) */
+    size_t n = encode_chunk(t, t->tx_seq++, hdr, hl, wire + wl, (int)wl);
     if (n == 0) { tun_fail(t, -1); return; }   /* AEAD seal failed: abort the handshake */
     wl += n;
     tun_send(t, wire, wl);
     /* chunk 0 is a wire record → advance the ramp so the first data record sees chunk_min+grow */
-    if (t->shape_out) sn_shape_chunk_advance(t->profile, &t->tx_chunk_target);
+    if (t->mode == SN_MODE_DEFAULT && t->shape_out) sn_shape_chunk_advance(t->profile, &t->tx_chunk_target);
     t->handshook = 1;
 }
 
@@ -235,21 +275,67 @@ static void send_handshake(sn_tunnel_t *t) {
  * phases) is computed directly from the PRNG per chunk — no per-chunk brute force. */
 #define RX_PAYLOAD_MAX 65535
 
+/* Deliver one s->c payload (decrypted, or plaintext for unsafe-raw) to the local
+ * client, consuming the leading status byte on the first payload (lazy-status reply
+ * protocol — mode-independent). Returns 0 normally, -1 if the tunnel was failed. */
+static int deliver_s2c(sn_tunnel_t *t, const uint8_t *B, size_t ol) {
+    if (!ol) return 0;
+    const uint8_t *dp = B; size_t dl = ol;
+    if (!t->s2c_started) {            /* first s2c payload: reply opcode */
+        t->s2c_started = 1;
+        uint8_t opcode = B[0];
+        if (opcode != SN_S2C_OK) {    /* error reply: [SN_S2C_ERROR][status][len][ASCII reason] */
+            int status = (opcode == SN_S2C_ERROR && ol >= 2) ? B[1] : opcode;
+            int rlen   = (opcode == SN_S2C_ERROR && ol >= 3) ? B[2] : 0;
+            t->err_status = status; t->err_reason[0] = 0;
+            if (rlen > 0 && (size_t)(3 + rlen) <= ol) {
+                int n = rlen < (int)sizeof(t->err_reason)-1 ? rlen : (int)sizeof(t->err_reason)-1;
+                memcpy(t->err_reason, B + 3, n); t->err_reason[n] = 0;
+            }
+            TLOG("[tun] server error opcode=0x%02x status=0x%02x reason=\"%s\"\n",
+                    opcode, status, t->err_reason);
+            tun_fail(t,-1); return -1;
+        }
+        dp = B + 1; dl = ol - 1;
+    }
+    if (dl && t->on_data) t->on_data(t, dp, dl);
+    return 0;
+}
+
 static void rx_process(sn_tunnel_t *t) {
     for (;;) {
         uint8_t *base = t->rx_buf + t->rx_off;       /* unconsumed window [rx_off, rx_len) */
         size_t   avail = t->rx_len - t->rx_off;
         if (!t->rx_have_salt) {
-            if (avail < (size_t)t->profile->salt_block_len) return;
+            if (t->mode == SN_MODE_UNSAFE_RAW) { t->rx_have_salt = 1; continue; }  /* no salt in plaintext mode */
+            int salt_len = (t->mode == SN_MODE_UNSHAPED) ? 16 : t->profile->salt_block_len;
+            if (avail < (size_t)salt_len) return;
             uint8_t real_salt[16];
-            sn_salt_deobfuscate(t->profile, base, real_salt);
+            if (t->mode == SN_MODE_UNSHAPED) memcpy(real_salt, base, 16);     /* raw 16-byte salt */
+            else sn_salt_deobfuscate(t->profile, base, real_salt);
             if (sn_derive_key(t->profile->psk, real_salt, t->key_sc) != 0) { tun_fail(t,-1); return; }
-            t->rx_off += t->profile->salt_block_len;
+            t->rx_off += salt_len;
             t->rx_have_salt = 1;
             continue;
         }
+        if (t->mode == SN_MODE_UNSAFE_RAW) {         /* plaintext frame: [04 00 00 00 00 len_be16][payload] */
+            if (avail < (size_t)SN_RAW_HDR_LEN) return;
+            if (base[0] != SN_REC_TYPE_DATA || base[1] || base[2] || base[3] || base[4]) {
+                TLOG("[tun] rx raw frame bad header seq=%u\n", t->rx_seq); tun_fail(t,-1); return; }
+            int plen = (base[5]<<8) | base[6];
+            if (avail < (size_t)SN_RAW_HDR_LEN + plen) return;   /* await full frame */
+            t->rx_off += (size_t)SN_RAW_HDR_LEN + plen; t->rx_seq++;
+            if (plen == 0) {   /* zero-length frame = peer write-EOF (half-close) */
+                if (t->on_peer_eof && !t->peer_eof_seen) { t->peer_eof_seen = 1; t->on_peer_eof(t); }
+                if (t->closed) return;
+                continue;
+            }
+            if (deliver_s2c(t, base + SN_RAW_HDR_LEN, (size_t)plen) != 0) return;
+            if (t->closed) return;
+            continue;
+        }
         if (!t->pend) {                              /* compute prefix, decrypt control */
-            int prefix_len = sn_shape_prefix_len(t->profile, SN_DIR_S2C, t->rx_seq);
+            int prefix_len = (t->mode == SN_MODE_UNSHAPED) ? 0 : sn_shape_prefix_len(t->profile, SN_DIR_S2C, t->rx_seq);
             if (avail < (size_t)prefix_len + SN_CTRL_WIRE_LEN) return;     /* need control */
             uint8_t ctl[SN_CTRL_PLAIN_LEN]; size_t cl;
             if (sn_aead_open(&t->rx_aead_ctx, t->key_sc, t->rx_nonce, base, prefix_len,
@@ -260,7 +346,7 @@ static void rx_process(sn_tunnel_t *t) {
             t->pend_pad = (ctl[3]<<8)|ctl[4]; t->pend_payload = (ctl[5]<<8)|ctl[6];
             if (t->pend_payload > RX_PAYLOAD_MAX) { tun_fail(t,-1); return; }
 #ifdef IPL_VERIFY
-            {   /* compare my inter_pad_len prediction to the SERVER's actual pad_len */
+            if (t->mode == SN_MODE_DEFAULT) {   /* compare my inter_pad_len prediction to the SERVER's actual pad_len */
                 int prior = (t->rx_seq == 0) ? t->profile->salt_block_len : 0;
                 int pred  = inter_pad_len(t->profile, t->rx_seq, t->pend_payload, prior);
                 fprintf(stderr, "IPL %s seq=%u payload=%d prior=%d pred=%d actual=%d\n",
@@ -291,27 +377,7 @@ static void rx_process(sn_tunnel_t *t) {
         }
         t->rx_nonce += 2; t->rx_seq++; t->pend = 0;
         t->rx_off += total;                          /* consume by offset (no memmove) */
-        if (ol) {
-            const uint8_t *dp = B; size_t dl = ol;
-            if (!t->s2c_started) {            /* first s2c payload: reply opcode */
-                t->s2c_started = 1;
-                uint8_t opcode = B[0];
-                if (opcode != SN_S2C_OK) {    /* error reply: [SN_S2C_ERROR][status][len][ASCII reason] */
-                    int status = (opcode == SN_S2C_ERROR && ol >= 2) ? B[1] : opcode;
-                    int rlen   = (opcode == SN_S2C_ERROR && ol >= 3) ? B[2] : 0;
-                    t->err_status = status; t->err_reason[0] = 0;
-                    if (rlen > 0 && (size_t)(3 + rlen) <= ol) {
-                        int n = rlen < (int)sizeof(t->err_reason)-1 ? rlen : (int)sizeof(t->err_reason)-1;
-                        memcpy(t->err_reason, B + 3, n); t->err_reason[n] = 0;
-                    }
-                    TLOG("[tun] server error opcode=0x%02x status=0x%02x reason=\"%s\"\n",
-                            opcode, status, t->err_reason);
-                    tun_fail(t,-1); return;
-                }
-                dp = B + 1; dl = ol - 1;
-            }
-            if (dl && t->on_data) t->on_data(t, dp, dl);
-        }
+        if (deliver_s2c(t, B, ol) != 0) return;
         if (t->closed) return;
     }
 }
@@ -399,11 +465,12 @@ static void on_resolved(uv_getaddrinfo_t *r, int status, struct addrinfo *res) {
 
 int sn_tunnel_open(sn_tunnel_t *t, uv_loop_t *loop,
                    const char *server_host, int server_port, const sn_profile_t *profile,
-                   const char *target_host, int target_port, uint8_t cmd,
+                   const char *target_host, int target_port, uint8_t cmd, int mode,
                    sn_tun_data_cb on_data, sn_tun_ready_cb on_ready,
                    sn_tun_close_cb on_close, void *user) {
     memset(t, 0, sizeof(*t));
     t->loop = loop; t->server_port = server_port; t->target_port = target_port; t->cmd = cmd;
+    t->mode = mode;     /* set before any (possibly synchronous) connect/handshake reads it */
     t->shape_out = 1;   /* outbound shaping on by default (v6 anti-detection) */
     strncpy(t->server_host, server_host, sizeof(t->server_host)-1);
     strncpy(t->target_host, target_host, sizeof(t->target_host)-1);

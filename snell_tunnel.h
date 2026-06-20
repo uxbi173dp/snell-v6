@@ -25,6 +25,13 @@ typedef struct sn_tunnel sn_tunnel_t;
 #define SN_CMD_UDP         0x06   /* native UDP (no target host/port in the header) */
 #define SN_PROTO_VERSION   0x01   /* request-header version byte                  */
 
+/* Protocol mode (b3 `mode` config; client and server MUST agree). The mode is a
+ * pure both-directions wire switch: it gates the salt encoding and which framing/
+ * crypto layers run. The request header and lazy-status reply are mode-independent. */
+#define SN_MODE_DEFAULT    0   /* obfuscated salt block + full v6 shaping + AES-128-GCM   */
+#define SN_MODE_UNSHAPED   1   /* raw 16-byte salt + AES-128-GCM, no shaping (≈ Snell v3) */
+#define SN_MODE_UNSAFE_RAW 2   /* plaintext length-prefixed frames, no salt/KDF/AEAD      */
+
 extern int sn_log_verbose;   /* chatty diagnostics gate (set by the proxy via -v) */
 
 /* server -> client application data (already de-shaped & decrypted) */
@@ -91,7 +98,8 @@ struct sn_tunnel {
     int             s2c_started;   /* first server->client payload carries a status byte */
     int             err_status;    /* server error status byte (0=none); see PROTOCOL.md */
     char            err_reason[128];/* ASCII reason from the server error frame */
-    int             shape_out;     /* apply outbound inter-pad + interleave (stealth) */
+    int             shape_out;     /* apply outbound inter-pad + interleave (stealth; default mode only) */
+    int             mode;          /* SN_MODE_* — wire mode (both directions); must match server */
     int             tcp_fastopen;  /* use TCP Fast Open for the server connection */
 
     /* invoked once t->tcp's uv_close has fully completed (after rx_buf freed).
@@ -102,7 +110,7 @@ struct sn_tunnel {
 /* Start a tunnel: resolve+connect to server, send handshake for target. */
 int sn_tunnel_open(sn_tunnel_t *t, uv_loop_t *loop,
                    const char *server_host, int server_port, const sn_profile_t *profile,
-                   const char *target_host, int target_port, uint8_t cmd,
+                   const char *target_host, int target_port, uint8_t cmd, int mode,
                    sn_tun_data_cb on_data, sn_tun_ready_cb on_ready,
                    sn_tun_close_cb on_close, void *user);
 
