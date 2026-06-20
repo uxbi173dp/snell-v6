@@ -1,5 +1,5 @@
 /*
- * snell_salt.h — Snell v6 (b2) salt-block obfuscation parameters.
+ * snell_salt.h — Snell v6 (b3) salt-block obfuscation parameters.
  *
  * Derives, from the shared shaping PRNG, the three things the salt carrier
  * needs: the on-wire block length, the 16 scatter indices S[], and the 16-byte

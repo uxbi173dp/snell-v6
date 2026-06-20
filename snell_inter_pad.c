@@ -1,6 +1,6 @@
 /*
- * snell_inter_pad.c — byte-EXACT reproduction of the Snell v6 (b2) server's
- * inter-pad LENGTH computation, validated live against /root/snellv6/snell-server.
+ * snell_inter_pad.c — byte-EXACT reproduction of the Snell v6 (b3) server's
+ * inter-pad LENGTH computation, validated live against the reference snell-server.
  *
  * Reverse-engineered from the unpacked memory dump (RVAs == text.bin offsets):
  *   builder      0x3b020  (composition; final pad_len ror'd & stored at 0x3b13d)

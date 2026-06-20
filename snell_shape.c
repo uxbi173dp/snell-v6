@@ -1,5 +1,5 @@
 /*
- * snell_shape.c — Snell v6 (b2) per-PSK profile & traffic shaping.
+ * snell_shape.c — Snell v6 (b3) per-PSK profile & traffic shaping.
  *
  * Builds the deployment profile from the PSK and implements the shaping the wire
  * format needs: salt obfuscation, prefix-pad length, pad content (4 modes),

@@ -1,5 +1,5 @@
 /*
- * snell_crypto.h — Snell v6 (b2) crypto: Argon2id key derivation + AES-128-GCM
+ * snell_crypto.h — Snell v6 (b3) crypto: Argon2id key derivation + AES-128-GCM
  * AEAD.
  *
  * Thin wrappers over libsodium (Argon2id KDF) and OpenSSL (AES-GCM); no bespoke

@@ -1,5 +1,5 @@
 /*
- * snell_tunnel.h — libuv Snell v6 (b2) client tunnel.
+ * snell_tunnel.h — libuv Snell v6 (b3) client tunnel.
  *
  * One tunnel = one TCP connection to the Snell server carrying one proxied
  * target stream. Handles: async connect, the shaped handshake (salt + request

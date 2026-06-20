@@ -1,5 +1,5 @@
 /*
- * snell_prng.h — the single Snell v6 (b2) shaping-PRNG core.
+ * snell_prng.h — the single Snell v6 (b3) shaping-PRNG core.
  *
  * Every shaped byte the protocol emits is a deterministic function of the PSK,
  * computed through this PRNG: a wyhash/splitmix construction seeded from

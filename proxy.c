@@ -1,5 +1,5 @@
 /*
- * proxy.c — local SOCKS5 + HTTP CONNECT proxy front end over Snell v6 (b2).
+ * proxy.c — local SOCKS5 + HTTP CONNECT proxy front end over Snell v6 (b3).
  *
  * Each accepted local connection: parse target (SOCKS5 or HTTP CONNECT),
  * open a Snell tunnel to the server, then relay bidirectionally.

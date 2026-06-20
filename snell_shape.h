@@ -1,5 +1,5 @@
 /*
- * snell_shape.h — Snell v6 (b2) per-PSK profile & traffic shaping.
+ * snell_shape.h — Snell v6 (b3) per-PSK profile & traffic shaping.
  *
  * Derives the deployment profile from the PSK and provides the shaping
  * operations the wire format needs:

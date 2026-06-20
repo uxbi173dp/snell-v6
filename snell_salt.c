@@ -1,5 +1,5 @@
 /*
- * snell_salt.c — Snell v6 (b2) salt-block obfuscation.
+ * snell_salt.c — Snell v6 (b3) salt-block obfuscation.
  *
  * The 16-byte AEAD salt is not sent in the clear: it is scattered across the
  * first `block_len` wire bytes of a session, the rest being profile-shaped
